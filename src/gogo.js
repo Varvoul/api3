@@ -4,7 +4,7 @@ import {
 } from "./gogo_extractor.js";
 import cheerio from "cheerio";
 
-const BaseURL = "https://gogoanime3.co";
+const BaseURL = "https://gogoanime.by";
 const USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36";
 
@@ -207,7 +207,6 @@ async function GogoDLScrapper(animeid, cookie) {
             },
         });
         const html = await response.text();
-        // const cheerio = require("cheerio");
         const body = cheerio.load(html);
         let data = {};
         const links = body("div.cf-download").find("a");
@@ -245,6 +244,3 @@ export {
     GogoDLScrapper,
     getGogoAuthKey,
 };
-// getEpisode("horimiya-episode-1").then((data) => {
-//     console.log(data.stream.sources);
-// });
