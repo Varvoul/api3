@@ -57,6 +57,7 @@ function handleOptions(request) {
 
 export default {
     async fetch(request, env, ctx) {
+        try {
         if (request.method === "OPTIONS") {
             // Handle CORS preflight requests
             return handleOptions(request);
@@ -100,7 +101,7 @@ export default {
                 const data = await getSearch(query, page);
 
                 if (data.length == 0) {
-                    throw new Error("Not found");
+                    return new Response(JSON.stringify({ error: "Not found", results: [] }), { status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
                 }
 
                 SEARCH_CACHE[query + page.toString()] = data;
@@ -143,7 +144,7 @@ export default {
                 const data = { anilistTrending, gogoPopular };
 
                 if ((anilistTrending.length == 0) & (gogoPopular.length == 0)) {
-                    throw new Error("Something went wrong!");
+                    return new Response(JSON.stringify({ error: "Something went wrong", results: [] }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
                 }
                 if ((anilistTrending.length != 0) & (gogoPopular.length != 0)) {
                     HOME_CACHE["data"] = data;
@@ -178,7 +179,7 @@ export default {
                 try {
                     data = await getAnime(anime);
                     if (data.name == "") {
-                        throw new Error("Not found");
+                        return new Response(JSON.stringify({ error: "Not found", results: [] }), { status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
                     }
                     data.source = "gogoanime";
                 } catch (err) {
@@ -198,7 +199,7 @@ export default {
                 }
 
                 if (data == {}) {
-                    throw new Error("Not found");
+                    return new Response(JSON.stringify({ error: "Not found", results: [] }), { status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
                 }
                 if (data.episodes.length != 0) {
                     ANIME_CACHE[anime] = data;
@@ -275,7 +276,7 @@ export default {
                 const data = await getRecentAnime(page);
 
                 if (data.length == 0) {
-                    throw new Error("Not found");
+                    return new Response(JSON.stringify({ error: "Not found", results: [] }), { status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
                 }
 
                 const json = JSON.stringify({ results: data });
@@ -306,7 +307,7 @@ export default {
                 data = data["recommendations"];
 
                 if (data.length == 0) {
-                    throw new Error("Not found");
+                    return new Response(JSON.stringify({ error: "Not found", results: [] }), { status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
                 }
 
                 REC_CACHE[query] = data;
@@ -386,6 +387,12 @@ export default {
             return new Response(null, {
                 status: 405,
                 statusText: "Method Not Allowed",
+            });
+        }
+        } catch(err) {
+            return new Response(JSON.stringify({ error: err.message || "Internal server error", results: [] }), {
+                status: 500,
+                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
             });
         }
     },
