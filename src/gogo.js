@@ -1,5 +1,4 @@
-// gogo.js - Unified MAL+AniList ID handling + miruro pipe streams
-// IDs from search are MAL IDs. /anime/{id} accepts both MAL and AniList IDs.
+// gogo.js - AniList search by title for correct IDs + Jikan for metadata + miruro pipe for streams
 
 const PIPE = "https://www.miruro.to/api/secure/pipe";
 const JIKAN = "https://api.jikan.moe/v4";
@@ -10,39 +9,81 @@ const PIPE_HEADERS = {
     "Referer": "https://www.miruro.to/",
     "Origin": "https://www.miruro.to",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
 };
 
-// ── AniList helpers ───────────────────────────────────────────────────────────
+// ── AniList: search by title → returns id (AniList ID) + idMal ───────────────
 
-async function alQuery(query, variables = {}) {
-    const res = await fetch(ANILIST, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ query, variables }),
-    });
-    if (!res.ok) throw new Error(`AniList ${res.status}`);
-    const json = await res.json();
-    if (json.errors) throw new Error(json.errors[0].message);
-    return json.data;
-}
-
-// MAL ID → AniList ID (best-effort, returns null if AniList is down)
-async function malToAL(malId) {
+async function alSearchByTitle(title) {
     try {
-        const d = await alQuery(`query($id:Int){Media(idMal:$id,type:ANIME){id}}`, { id: parseInt(malId) });
-        return d?.Media?.id || null;
+        const res = await fetch(ANILIST, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({
+                query: `query($s:String){
+                    Media(search:$s, type:ANIME){
+                        id idMal
+                        title { romaji english native }
+                        status source genres episodes seasonYear averageScore
+                        bannerImage description(asHtml:false)
+                        coverImage { extraLarge large }
+                        studios { edges { isMain node { id name } } }
+                        relations { edges { relationType node { id title { romaji } type } } }
+                        streamingEpisodes { title thumbnail }
+                    }
+                }`,
+                variables: { s: title }
+            }),
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        return json?.data?.Media || null;
     } catch(_) { return null; }
 }
 
-// AniList ID → MAL ID (best-effort)
-async function alToMAL(alId) {
+// AniList: lookup by AniList ID
+async function alById(alId) {
     try {
-        const d = await alQuery(`query($id:Int){Media(id:$id,type:ANIME){idMal}}`, { id: parseInt(alId) });
-        return d?.Media?.idMal || null;
+        const res = await fetch(ANILIST, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({
+                query: `query($id:Int){
+                    Media(id:$id, type:ANIME){
+                        id idMal
+                        title { romaji english native }
+                        status source genres episodes seasonYear averageScore
+                        bannerImage description(asHtml:false)
+                        coverImage { extraLarge large }
+                    }
+                }`,
+                variables: { id: parseInt(alId) }
+            }),
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        return json?.data?.Media || null;
     } catch(_) { return null; }
 }
 
-// ── Jikan helpers ─────────────────────────────────────────────────────────────
+// AniList: lookup by MAL ID → get AniList ID
+async function alByMalId(malId) {
+    try {
+        const res = await fetch(ANILIST, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({
+                query: `query($id:Int){ Media(idMal:$id, type:ANIME){ id idMal title { romaji english } coverImage { large } startDate { year } } }`,
+                variables: { id: parseInt(malId) }
+            }),
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        return json?.data?.Media || null;
+    } catch(_) { return null; }
+}
+
+// ── Jikan fallback ────────────────────────────────────────────────────────────
 
 async function jikan(path) {
     const res = await fetch(`${JIKAN}${path}`, { headers: { "Accept": "application/json" } });
@@ -107,39 +148,60 @@ async function pipeFetch(path, query) {
     return gunzipCF(text.trim());
 }
 
-// Fetch episodes from miruro trying both AniList and MAL IDs
+// Fetch episodes trying both AniList and MAL IDs
 async function fetchEpisodes(anilistId, malId) {
-    // Try AniList ID first
-    try {
-        const data = await pipeFetch("episodes", { anilistId: String(anilistId) });
-        if (data?.providers && Object.keys(data.providers).length > 0) return data;
-    } catch(_) {}
-    // Fallback to MAL ID if different
-    if (malId && String(malId) !== String(anilistId)) {
+    for (const id of [String(anilistId), malId ? String(malId) : null].filter(Boolean)) {
         try {
-            const data = await pipeFetch("episodes", { anilistId: String(malId) });
-            if (data?.providers && Object.keys(data.providers).length > 0) return data;
+            const data = await pipeFetch("episodes", { anilistId: id });
+            if (data?.providers && Object.keys(data.providers).length > 0) {
+                return { data, usedId: id };
+            }
         } catch(_) {}
     }
-    return null;
+    return { data: null, usedId: String(anilistId) };
+}
+
+// ── Build episode list from pipe response ─────────────────────────────────────
+
+function buildEpisodeList(epData, anilistId) {
+    const episodes = [];
+    const providers_summary = {};
+    if (!epData?.providers) return { episodes, providers_summary };
+    deepTranslate(epData);
+    for (const [provName, provData] of Object.entries(epData.providers)) {
+        const eps = provData?.episodes || {};
+        const streamType = provData?.streamType || "hls";
+        providers_summary[provName] = { streamType, categories: [] };
+        for (const [cat, epList] of Object.entries(eps)) {
+            if (!Array.isArray(epList)) continue;
+            if (!providers_summary[provName].categories.includes(cat))
+                providers_summary[provName].categories.push(cat);
+            for (const ep of epList) {
+                episodes.push([
+                    String(ep.number ?? ep.id),
+                    `${provName}:${anilistId}:${cat}:${ep.id}`,
+                ]);
+            }
+        }
+    }
+    return { episodes, providers_summary };
 }
 
 // ── Exported functions ────────────────────────────────────────────────────────
 
 async function getSearch(name, page = 1) {
-    // Jikan search - always works, returns MAL IDs
-    // Try to get AniList IDs in parallel for miruro compatibility
+    // Use Jikan for search (fast, reliable), then resolve AniList IDs in parallel
     const data = await jikan(`/anime?q=${encodeURIComponent(name)}&page=${parseInt(page)}&limit=20&sfw=true`);
     const items = data.data || [];
     const results = await Promise.all(items.map(async a => {
-        const alId = await malToAL(a.mal_id); // best-effort
+        const al = await alByMalId(a.mal_id);
         return {
             title: a.title_english || a.title || null,
             img: a.images?.jpg?.image_url || null,
-            id: String(alId || a.mal_id),      // AniList ID preferred, MAL fallback
+            id: al ? String(al.id) : String(a.mal_id),      // AniList ID
             malId: String(a.mal_id),
-            anilistId: alId ? String(alId) : null,
-            link: `https://www.miruro.to/watch/${alId || a.mal_id}`,
+            anilistId: al ? String(al.id) : null,
+            link: `https://www.miruro.to/watch/${al ? al.id : a.mal_id}`,
             releaseDate: a.year ? String(a.year) : null,
         };
     }));
@@ -147,95 +209,103 @@ async function getSearch(name, page = 1) {
 }
 
 async function getAnime(id) {
-    if (isNaN(parseInt(id))) {
-        // It's a name string - search first
-        const r = await getSearch(id);
-        if (!r.length) throw new Error("Not found");
-        return getAnime(r[0].id);
-    }
-
     const numId = parseInt(id);
-    let malId = numId;
-    let anilistId = numId;
+    if (isNaN(numId)) {
+        // Name string — search by title via AniList
+        const alMedia = await alSearchByTitle(id);
+        if (!alMedia) throw new Error("Not found");
+        return _buildAnimeResponse(alMedia);
+    }
+
+    // Try as AniList ID first, then as MAL ID
+    let alMedia = await alById(numId);
+    if (!alMedia) {
+        // Try as MAL ID
+        alMedia = await alByMalId(numId);
+    }
+
+    if (alMedia) {
+        return _buildAnimeResponse(alMedia);
+    }
+
+    // Final fallback: pure Jikan, no AniList
+    const jRes = await jikan(`/anime/${numId}/full`);
+    const jd = jRes.data;
+    if (!jd) throw new Error("Not found");
+    const { data: epData, usedId } = await fetchEpisodes(numId, null);
+    const { episodes, providers_summary } = buildEpisodeList(epData, usedId || numId);
+    return {
+        name: jd.title_english || jd.title,
+        image: jd.images?.jpg?.large_image_url || null,
+        id: String(numId),
+        malId: String(numId),
+        genre: (jd.genres || []).map(g => g.name).join(", "),
+        type: jd.type || null,
+        status: jd.status || null,
+        plot_summary: jd.synopsis || null,
+        released: jd.year ? String(jd.year) : null,
+        episodes,
+        total_episodes: jd.episodes || episodes.length,
+        score: jd.score || null,
+        providers: providers_summary,
+        miruro_url: `https://www.miruro.to/watch/${numId}`,
+    };
+}
+
+async function _buildAnimeResponse(alMedia) {
+    const anilistId = alMedia.id;
+    const malId = alMedia.idMal;
+
+    // Get Jikan data for richer metadata (score, synopsis etc)
     let jikanData = null;
-
-    // Strategy: try as MAL ID first (Jikan), then try as AniList ID
-    try {
-        const res = await jikan(`/anime/${numId}/full`);
-        jikanData = res.data;
-        malId = jikanData.mal_id;
-        // Get AniList ID from MAL ID
-        const alId = await malToAL(malId);
-        anilistId = alId || malId;
-    } catch(e) {
-        // numId is likely an AniList ID - get MAL ID from AniList
-        const mId = await alToMAL(numId);
-        if (mId) {
-            malId = mId;
-            anilistId = numId;
-            try {
-                const res = await jikan(`/anime/${malId}/full`);
-                jikanData = res.data;
-            } catch(_) {}
-        }
-        if (!jikanData) throw new Error("Not found");
+    if (malId) {
+        try {
+            const j = await jikan(`/anime/${malId}/full`);
+            jikanData = j.data;
+        } catch(_) {}
     }
 
-    // Fetch miruro episodes (try both IDs)
-    let episodes = [];
-    let providers_summary = {};
-    const epData = await fetchEpisodes(anilistId, malId);
-    if (epData?.providers) {
-        deepTranslate(epData);
-        for (const [provName, provData] of Object.entries(epData.providers)) {
-            const eps = provData?.episodes || {};
-            const streamType = provData?.streamType || "hls";
-            providers_summary[provName] = { streamType, categories: [] };
-            for (const [cat, epList] of Object.entries(eps)) {
-                if (!Array.isArray(epList)) continue;
-                if (!providers_summary[provName].categories.includes(cat))
-                    providers_summary[provName].categories.push(cat);
-                for (const ep of epList) {
-                    episodes.push([
-                        String(ep.number ?? ep.id),
-                        `${provName}:${anilistId}:${cat}:${ep.id}`,
-                    ]);
-                }
-            }
-        }
-    } else {
-        providers_summary = { status: "No episodes found from miruro providers" };
-    }
+    // Fetch miruro episodes
+    const { data: epData, usedId } = await fetchEpisodes(anilistId, malId);
+    const { episodes, providers_summary } = buildEpisodeList(epData, usedId || anilistId);
 
     return {
-        name: jikanData.title_english || jikanData.title,
-        image: jikanData.images?.jpg?.large_image_url || null,
-        id: String(anilistId),
-        malId: String(malId),
-        genre: (jikanData.genres || []).map(g => g.name).join(", "),
-        type: jikanData.type || null,
-        status: jikanData.status || null,
-        plot_summary: jikanData.synopsis || null,
-        released: jikanData.year ? String(jikanData.year) : null,
+        name: alMedia.title?.english || alMedia.title?.romaji || jikanData?.title_english || jikanData?.title,
+        image: alMedia.coverImage?.extraLarge || alMedia.coverImage?.large || jikanData?.images?.jpg?.large_image_url || null,
+        id: String(anilistId),         // ✅ Always AniList ID
+        malId: malId ? String(malId) : null,
+        genre: alMedia.genres ? alMedia.genres.join(", ") : (jikanData?.genres||[]).map(g=>g.name).join(", "),
+        type: jikanData?.type || alMedia.source || null,
+        status: alMedia.status || jikanData?.status || null,
+        plot_summary: alMedia.description || jikanData?.synopsis || null,
+        released: alMedia.seasonYear ? String(alMedia.seasonYear) : (jikanData?.year ? String(jikanData.year) : null),
         episodes,
-        total_episodes: jikanData.episodes || episodes.length,
-        score: jikanData.score || null,
+        total_episodes: alMedia.episodes || jikanData?.episodes || episodes.length,
+        score: alMedia.averageScore || (jikanData?.score ? Math.round(jikanData.score * 10) : null),
         providers: providers_summary,
         miruro_url: `https://www.miruro.to/watch/${anilistId}`,
+        studios: (alMedia.studios?.edges || []).filter(e => e.isMain).map(e => e.node?.name).filter(Boolean),
+        relations: (alMedia.relations?.edges || []).map(e => ({
+            type: e.relationType,
+            id: String(e.node?.id),
+            title: e.node?.title?.romaji,
+            mediaType: e.node?.type,
+        })),
+        streaming_episodes: alMedia.streamingEpisodes || [],
     };
 }
 
 async function getRecentAnime(page = 1) {
     const data = await jikan(`/seasons/now?page=${parseInt(page)}&limit=24`);
     return Promise.all((data.data || []).map(async a => {
-        const alId = await malToAL(a.mal_id);
+        const al = await alByMalId(a.mal_id);
         return {
             title: a.title_english || a.title || null,
             episode: `Episode ${a.episodes || "?"}`,
             image: a.images?.jpg?.image_url || null,
-            id: String(alId || a.mal_id),
+            id: al ? String(al.id) : String(a.mal_id),
             malId: String(a.mal_id),
-            miruro_url: `https://www.miruro.to/watch/${alId || a.mal_id}`,
+            miruro_url: `https://www.miruro.to/watch/${al ? al.id : a.mal_id}`,
         };
     }));
 }
@@ -243,39 +313,58 @@ async function getRecentAnime(page = 1) {
 async function getPopularAnime(page = 1, max = 20) {
     const data = await jikan(`/top/anime?page=${parseInt(page)}&limit=${max}&filter=bypopularity`);
     return Promise.all((data.data || []).slice(0, max).map(async a => {
-        const alId = await malToAL(a.mal_id);
+        const al = await alByMalId(a.mal_id);
         return {
             title: a.title_english || a.title || null,
             releaseDate: a.year ? String(a.year) : null,
             image: a.images?.jpg?.image_url || null,
-            id: String(alId || a.mal_id),
+            id: al ? String(al.id) : String(a.mal_id),
             malId: String(a.mal_id),
-            miruro_url: `https://www.miruro.to/watch/${alId || a.mal_id}`,
+            miruro_url: `https://www.miruro.to/watch/${al ? al.id : a.mal_id}`,
         };
     }));
 }
 
 async function getEpisode(id) {
-    const parts = id.split(":");
-    if (parts.length < 4) {
+    // id format: "provider:anilistId:sub|dub:episodeId"
+    // episodeId can contain colons (e.g. "animepahe:1571:15779:8")
+    const firstColon = id.indexOf(":");
+    const secondColon = id.indexOf(":", firstColon + 1);
+    const thirdColon = id.indexOf(":", secondColon + 1);
+
+    if (firstColon === -1 || secondColon === -1 || thirdColon === -1) {
         return {
             error: "Invalid format. Use: provider:anilistId:sub|dub:episodeId",
             tip: "Get episode IDs from /anime/{id} first",
         };
     }
-    const [provider, anilistId, category, ...rest] = parts;
-    const episodeId = rest.join(":");
+
+    const provider = id.slice(0, firstColon);
+    const anilistId = id.slice(firstColon + 1, secondColon);
+    const category = id.slice(secondColon + 1, thirdColon);
+    const episodeId = id.slice(thirdColon + 1);   // everything after 3rd colon
+
+    // The episodeId must be base64url encoded for the pipe
     const encId = b64url(episodeId);
+
     const data = await pipeFetch("sources", {
-        episodeId: encId, provider, category, anilistId,
+        episodeId: encId,
+        provider,
+        category,
+        anilistId,
     });
+
     return {
-        provider, anilistId, category, episodeId,
+        provider,
+        anilistId,
+        category,
+        episodeId,
         sources: data?.sources || data?.stream || [],
         subtitles: data?.subtitles || data?.tracks || [],
         intro: data?.intro || null,
         outro: data?.outro || null,
         headers: data?.headers || null,
+        raw: (data?.sources?.length === 0 && !data?.stream) ? data : undefined,
     };
 }
 
