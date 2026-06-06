@@ -186,15 +186,21 @@ export default {
                     try {
                         // try to get by search on gogo
                         const search = await getSearch(anime);
+                        if (!search || search.length === 0) throw new Error("Not found");
                         anime = search[0].id;
                         data = await getAnime(anime);
-                        data.source = "gogoanime";
+                        data.source = "jikan";
                     } catch (err) {
                         // try to get by search on anilist
-                        const search = await getAnilistSearch(anime);
-                        anime = search["results"][0].id;
-                        data = await getAnilistAnime(anime);
-                        data.source = "anilist";
+                        try {
+                            const search = await getAnilistSearch(anime);
+                            if (!search || !search["results"] || search["results"].length === 0) throw new Error("Not found");
+                            anime = search["results"][0].id;
+                            data = await getAnilistAnime(anime);
+                            data.source = "anilist";
+                        } catch(e2) {
+                            return new Response(JSON.stringify({ error: "Not found", results: [] }), { status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+                        }
                     }
                 }
 
