@@ -1,110 +1,98 @@
-function anilistSearchQuery(query, page, perPage = 10, type = "ANIME") {
-    return `query ($page: Int = ${page}, $id: Int, $type: MediaType = ${type}, $search: String = "${query}", $isAdult: Boolean = false, $size: Int = ${perPage}) { Page(page: $page, perPage: $size) { pageInfo { total perPage currentPage lastPage hasNextPage } media(id: $id, type: $type, search: $search, isAdult: $isAdult) { id status(version: 2) title { userPreferred romaji english native } bannerImage popularity coverImage{ extraLarge large medium color } episodes format season description seasonYear averageScore genres  } } }`;
+// anilist.js - Rewritten to use Jikan v4 API (AniList is down)
+// Same exported function signatures - index.js unchanged
+
+const JIKAN = "https://api.jikan.moe/v4";
+
+async function jikan(path) {
+    const res = await fetch(`${JIKAN}${path}`, {
+        headers: { "Accept": "application/json" }
+    });
+    if (!res.ok) throw new Error(`Jikan ${res.status}: ${path}`);
+    return res.json();
 }
 
-function anilistTrendingQuery(page = 1, perPage = 10, type = "ANIME") {
-    return `query ($page: Int = ${page}, $id: Int, $type: MediaType = ${type}, $isAdult: Boolean = false, $size: Int = ${perPage}, $sort: [MediaSort] = [TRENDING_DESC, POPULARITY_DESC]) { Page(page: $page, perPage: $size) { pageInfo { total perPage currentPage lastPage hasNextPage } media(id: $id, type: $type, isAdult: $isAdult, sort: $sort) { id status(version: 2) title { userPreferred romaji english native } genres description format bannerImage coverImage{ extraLarge large medium color } episodes meanScore season seasonYear averageScore } } }`;
-}
-
-function anilistMediaDetailQuery(id) {
-    return `query ($id: Int = ${id}) { Media(id: $id) { id title { english native romaji userPreferred } coverImage { extraLarge large color } bannerImage season seasonYear description type format status(version: 2) episodes genres averageScore popularity meanScore recommendations { edges { node { id mediaRecommendation { id meanScore title { romaji english native userPreferred } status episodes coverImage { extraLarge large medium color } bannerImage format } } } } } }`;
-}
-
-function  anilistUpcomingQuery(page){
-  const perPage=20
-  const notYetAired=true
-
-  return `query { Page(page: ${page}, perPage: ${perPage}) { pageInfo { total perPage currentPage lastPage hasNextPage } airingSchedules( notYetAired: ${notYetAired}) { airingAt episode media { id description idMal title { romaji english userPreferred native } countryOfOrigin description popularity bannerImage coverImage { extraLarge large medium color } genres averageScore seasonYear format } } } }`;
-
-}
-async function getAnilistTrending() {
-    const url = "https://graphql.anilist.co";
-    const query = anilistTrendingQuery();
-    const options = {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
+function formatMedia(a) {
+    return {
+        id: a.mal_id,
+        status: a.status || null,
+        title: {
+            userPreferred: a.title_english || a.title,
+            romaji: a.title,
+            english: a.title_english || a.title,
+            native: a.title_japanese || null,
         },
-        body: JSON.stringify({
-            query: query,
-        }),
+        bannerImage: null,
+        popularity: a.members || 0,
+        coverImage: {
+            extraLarge: a.images?.jpg?.large_image_url || null,
+            large: a.images?.jpg?.large_image_url || null,
+            medium: a.images?.jpg?.image_url || null,
+            color: null,
+        },
+        episodes: a.episodes || null,
+        format: a.type || null,
+        season: a.season || null,
+        description: a.synopsis || null,
+        seasonYear: a.year || null,
+        averageScore: a.score ? Math.round(a.score * 10) : null,
+        genres: (a.genres || []).map(g => g.name),
+        meanScore: a.score ? Math.round(a.score * 10) : null,
     };
-    const res = await fetch(url, options);
-    let data = await res.json();
-    data = {
-        results: data["data"]["Page"]["media"],
-    };
-    return data;
+}
+
+async function getAnilistTrending() {
+    const data = await jikan("/top/anime?filter=airing&limit=10");
+    return { results: (data.data || []).map(formatMedia) };
 }
 
 async function getAnilistUpcoming(page) {
-    const url = "https://graphql.anilist.co";
-    const query = anilistUpcomingQuery(page);
-    const options = {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-        },
-        body: JSON.stringify({
-            query: query,
-        }),
-    };
-    const res = await fetch(url, options);
-    let data = await res.json();
-    data = {
-        results: data["data"]["Page"]["airingSchedules"],
-    };
-    return data;
+    const data = await jikan(`/seasons/upcoming?page=${parseInt(page)}&limit=20`);
+    const results = (data.data || []).map(a => ({
+        airingAt: null,
+        episode: 1,
+        media: formatMedia(a),
+    }));
+    return { results };
 }
 
 async function getAnilistSearch(query) {
-    const url = "https://graphql.anilist.co";
-    query = anilistSearchQuery(query, 1, 1);
-    const options = {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-        },
-        body: JSON.stringify({
-            query: query,
-        }),
-    };
-    const res = await fetch(url, options);
-    let data = await res.json();
-    data = {
-        results: data["data"]["Page"]["media"],
-    };
-    return data;
+    const data = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=1&sfw=true`);
+    return { results: (data.data || []).map(formatMedia) };
 }
 
 async function getAnilistAnime(id) {
-    const url = "https://graphql.anilist.co";
-    console.log(id);
-    const query = anilistMediaDetailQuery(id);
-    console.log(query);
-    const options = {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-        },
-        body: JSON.stringify({
-            query: query,
-        }),
-    };
-    const res = await fetch(url, options);
-    let data = await res.json();
-    let results = data["data"]["Media"];
-    results["recommendations"] = results["recommendations"]["edges"];
+    const data = await jikan(`/anime/${parseInt(id)}/full`);
+    const a = data.data;
+    if (!a) throw new Error("Not found");
 
-    for (let i = 0; i < results["recommendations"].length; i++) {
-        const rec = results["recommendations"][i];
-        results["recommendations"][i] = rec["node"]["mediaRecommendation"];
+    const result = formatMedia(a);
+    // Fetch recommendations
+    try {
+        const recData = await jikan(`/anime/${parseInt(id)}/recommendations`);
+        result.recommendations = (recData.data || []).slice(0, 8).map(r => ({
+            id: r.entry?.mal_id,
+            meanScore: null,
+            title: {
+                romaji: r.entry?.title,
+                english: r.entry?.title,
+                native: null,
+                userPreferred: r.entry?.title,
+            },
+            status: null,
+            episodes: null,
+            coverImage: {
+                extraLarge: r.entry?.images?.jpg?.large_image_url || null,
+                large: r.entry?.images?.jpg?.image_url || null,
+                medium: r.entry?.images?.jpg?.image_url || null,
+                color: null,
+            },
+            bannerImage: null,
+            format: null,
+        }));
+    } catch(e) {
+        result.recommendations = [];
     }
-    return results;
+    return result;
 }
 
-export { getAnilistTrending, getAnilistSearch, getAnilistAnime ,getAnilistUpcoming};
+export { getAnilistTrending, getAnilistSearch, getAnilistAnime, getAnilistUpcoming };
