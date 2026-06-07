@@ -1,6 +1,10 @@
-// gogo.js - AniList ONLY (no Jikan) + miruro pipe for streams
+// gogo.js
+// Search: Jikan (always works from CF Workers)
+// Metadata + episodes: miruro pipe (works with MAL ID for most anime)
+// AniList: single query per anime for ID mapping (not 20 parallel calls)
 
 const PIPE = "https://www.miruro.to/api/secure/pipe";
+const JIKAN = "https://api.jikan.moe/v4";
 const ANILIST = "https://graphql.anilist.co";
 
 const PIPE_HEADERS = {
@@ -10,39 +14,47 @@ const PIPE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 };
 
-// ── AniList queries ───────────────────────────────────────────────────────────
+// ── AniList single lookup (best-effort, falls back gracefully) ────────────────
 
-async function al(query, variables = {}) {
-    const res = await fetch(ANILIST, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ query, variables }),
-    });
-    if (!res.ok) throw new Error(`AniList ${res.status}`);
-    const json = await res.json();
-    if (json.errors) throw new Error(json.errors[0].message);
-    return json.data;
+async function alByMalId(malId) {
+    try {
+        const res = await fetch(ANILIST, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({
+                query: `query($id:Int){Media(idMal:$id,type:ANIME){id idMal}}`,
+                variables: { id: parseInt(malId) }
+            }),
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        return json?.data?.Media || null;
+    } catch(_) { return null; }
 }
 
-// Full media fields for anime detail
-const FULL_FIELDS = `
-    id idMal
-    title { romaji english native }
-    status source genres episodes seasonYear averageScore
-    bannerImage description(asHtml: false)
-    coverImage { extraLarge large }
-    studios { edges { isMain node { id name } } }
-    relations { edges { relationType node { id title { romaji } type } } }
-    streamingEpisodes { title thumbnail }
-`;
+async function alByTitle(title) {
+    try {
+        const res = await fetch(ANILIST, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({
+                query: `query($s:String){Media(search:$s,type:ANIME){id idMal title{romaji english}coverImage{large}startDate{year}genres episodes status averageScore description(asHtml:false)}}`,
+                variables: { s: title }
+            }),
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        return json?.data?.Media || null;
+    } catch(_) { return null; }
+}
 
-// Short fields for search listings
-const LIST_FIELDS = `
-    id idMal
-    title { romaji english }
-    coverImage { large }
-    startDate { year }
-`;
+// ── Jikan ─────────────────────────────────────────────────────────────────────
+
+async function jikan(path) {
+    const res = await fetch(`${JIKAN}${path}`, { headers: { "Accept": "application/json" } });
+    if (!res.ok) throw new Error(`Jikan ${res.status}`);
+    return res.json();
+}
 
 // ── Pipe helpers ──────────────────────────────────────────────────────────────
 
@@ -101,221 +113,168 @@ async function pipeFetch(path, query) {
     return gunzipCF(text.trim());
 }
 
-// Try fetching episodes with both AniList ID and MAL ID
-async function fetchEpisodesForId(anilistId, malId) {
-    const idsToTry = [...new Set([String(anilistId), malId ? String(malId) : null].filter(Boolean))];
-    for (const id of idsToTry) {
+async function fetchEpisodes(anilistId, malId) {
+    const ids = [...new Set([String(anilistId), malId ? String(malId) : null].filter(Boolean))];
+    for (const id of ids) {
         try {
             const data = await pipeFetch("episodes", { anilistId: id });
-            if (data?.providers && Object.keys(data.providers).length > 0) {
+            if (data?.providers && Object.keys(data.providers).length > 0)
                 return { data, usedId: id };
-            }
         } catch(_) {}
     }
     return { data: null, usedId: String(anilistId) };
 }
 
-function buildEpisodeList(epData, anilistId) {
-    const episodes = [];
-    const providers_summary = {};
-    if (!epData?.providers) return { episodes, providers_summary };
+function buildEpisodes(epData, anilistId) {
+    const episodes = [], providers = {};
+    if (!epData?.providers) return { episodes, providers };
     deepTranslate(epData);
-    for (const [provName, provData] of Object.entries(epData.providers)) {
-        const eps = provData?.episodes || {};
-        providers_summary[provName] = { streamType: provData?.streamType || "hls", categories: [] };
-        for (const [cat, epList] of Object.entries(eps)) {
-            if (!Array.isArray(epList)) continue;
-            if (!providers_summary[provName].categories.includes(cat))
-                providers_summary[provName].categories.push(cat);
-            for (const ep of epList) {
-                episodes.push([String(ep.number ?? ep.id), `${provName}:${anilistId}:${cat}:${ep.id}`]);
-            }
+    for (const [prov, pd] of Object.entries(epData.providers)) {
+        const eps = pd?.episodes || {};
+        providers[prov] = { streamType: pd?.streamType || "hls", categories: [] };
+        for (const [cat, list] of Object.entries(eps)) {
+            if (!Array.isArray(list)) continue;
+            if (!providers[prov].categories.includes(cat)) providers[prov].categories.push(cat);
+            for (const ep of list)
+                episodes.push([String(ep.number ?? ep.id), `${prov}:${anilistId}:${cat}:${ep.id}`]);
         }
     }
-    return { episodes, providers_summary };
-}
-
-// ── Format helpers ────────────────────────────────────────────────────────────
-
-function fmtMedia(m) {
-    return {
-        title: m.title?.english || m.title?.romaji || null,
-        img: m.coverImage?.large || null,
-        id: String(m.id),          // AniList ID always
-        malId: m.idMal ? String(m.idMal) : String(m.id),
-        anilistId: String(m.id),
-        link: `https://www.miruro.to/watch/${m.id}`,
-        releaseDate: m.startDate?.year ? String(m.startDate.year) : null,
-    };
+    return { episodes, providers };
 }
 
 // ── Exported functions ────────────────────────────────────────────────────────
 
 async function getSearch(name, page = 1) {
-    // AniList search — returns AniList IDs directly, no conversion needed
-    const data = await al(
-        `query($s:String,$p:Int){
-            Page(page:$p, perPage:20){
-                media(search:$s, type:ANIME, sort:SEARCH_MATCH){ ${LIST_FIELDS} }
-            }
-        }`,
-        { s: name, p: parseInt(page) }
-    );
-    return (data.Page?.media || []).map(fmtMedia);
+    // Jikan search — always works from CF Workers
+    const data = await jikan(`/anime?q=${encodeURIComponent(name)}&page=${parseInt(page)}&limit=20&sfw=true`);
+    return (data.data || []).map(a => ({
+        title: a.title_english || a.title || null,
+        img: a.images?.jpg?.image_url || null,
+        // Use MAL ID as id (same as AniList for most classic anime)
+        // For your website, use /anime/{malId} to get full details with correct AniList ID
+        id: String(a.mal_id),
+        malId: String(a.mal_id),
+        link: `https://www.miruro.to/watch/${a.mal_id}`,
+        releaseDate: a.year ? String(a.year) : null,
+        type: a.type || null,
+        episodes: a.episodes || null,
+        score: a.score || null,
+        status: a.status || null,
+    }));
 }
 
 async function getAnime(id) {
     const numId = parseInt(id);
-
     if (isNaN(numId)) {
-        // Name string — search by title
-        const data = await al(
-            `query($s:String){ Media(search:$s, type:ANIME){ ${FULL_FIELDS} } }`,
-            { s: id }
-        );
-        if (!data.Media) throw new Error("Not found");
-        return _buildResponse(data.Media);
+        // Name — try AniList first, fallback to Jikan search
+        const alMedia = await alByTitle(id);
+        if (alMedia) return _buildFromAL(alMedia);
+        const r = await getSearch(id);
+        if (!r.length) throw new Error("Not found");
+        return getAnime(r[0].id);
     }
 
-    // Try as AniList ID first
-    let media = null;
-    try {
-        const data = await al(
-            `query($id:Int){ Media(id:$id, type:ANIME){ ${FULL_FIELDS} } }`,
-            { id: numId }
-        );
-        media = data.Media;
-    } catch(_) {}
+    // Try AniList lookup by MAL ID to get correct AniList ID
+    const alMedia = await alByMalId(numId);
+    const anilistId = alMedia?.id || numId;
+    const malId = alMedia?.idMal || numId;
 
-    // If not found as AniList ID, try as MAL ID
-    if (!media) {
-        try {
-            const data = await al(
-                `query($id:Int){ Media(idMal:$id, type:ANIME){ ${FULL_FIELDS} } }`,
-                { id: numId }
-            );
-            media = data.Media;
-        } catch(_) {}
-    }
+    if (alMedia) return _buildFromAL(alMedia, numId);
 
-    if (!media) throw new Error("Not found");
-    return _buildResponse(media);
+    // AniList blocked — use Jikan only
+    const j = await jikan(`/anime/${numId}/full`);
+    const jd = j.data;
+    if (!jd) throw new Error("Not found");
+    const { data: epData, usedId } = await fetchEpisodes(numId, null);
+    const { episodes, providers } = buildEpisodes(epData, usedId || numId);
+    return {
+        name: jd.title_english || jd.title,
+        image: jd.images?.jpg?.large_image_url || null,
+        id: String(numId),
+        malId: String(numId),
+        genre: (jd.genres||[]).map(g=>g.name).join(", "),
+        type: jd.type || null,
+        status: jd.status || null,
+        plot_summary: jd.synopsis || null,
+        released: jd.year ? String(jd.year) : null,
+        episodes,
+        total_episodes: jd.episodes || episodes.length,
+        score: jd.score || null,
+        providers,
+        miruro_url: `https://www.miruro.to/watch/${numId}`,
+    };
 }
 
-async function _buildResponse(m) {
-    const anilistId = m.id;
-    const malId = m.idMal;
+async function _buildFromAL(alMedia, malIdOverride) {
+    const anilistId = alMedia.id;
+    const malId = alMedia.idMal || malIdOverride;
+    const { data: epData, usedId } = await fetchEpisodes(anilistId, malId);
+    const { episodes, providers } = buildEpisodes(epData, usedId || anilistId);
 
-    const { data: epData, usedId } = await fetchEpisodesForId(anilistId, malId);
-    const { episodes, providers_summary } = buildEpisodeList(epData, usedId || anilistId);
+    // Enrich with Jikan if we have malId
+    let jd = null;
+    if (malId) {
+        try { jd = (await jikan(`/anime/${malId}/full`)).data; } catch(_) {}
+    }
 
     return {
-        name: m.title?.english || m.title?.romaji,
-        image: m.coverImage?.extraLarge || m.coverImage?.large || null,
-        id: String(anilistId),           // ✅ AniList ID
+        name: alMedia.title?.english || alMedia.title?.romaji || jd?.title_english || jd?.title,
+        image: alMedia.coverImage?.large || jd?.images?.jpg?.large_image_url || null,
+        id: String(anilistId),
         malId: malId ? String(malId) : String(anilistId),
-        genre: (m.genres || []).join(", "),
-        type: m.source || null,
-        status: m.status || null,
-        plot_summary: m.description || null,
-        released: m.seasonYear ? String(m.seasonYear) : null,
+        genre: alMedia.genres ? alMedia.genres.join(", ") : (jd?.genres||[]).map(g=>g.name).join(", "),
+        type: jd?.type || null,
+        status: alMedia.status || jd?.status || null,
+        plot_summary: alMedia.description || jd?.synopsis || null,
+        released: alMedia.startDate?.year ? String(alMedia.startDate.year) : (jd?.year ? String(jd.year) : null),
         episodes,
-        total_episodes: m.episodes || episodes.length,
-        score: m.averageScore || null,
-        providers: providers_summary,
+        total_episodes: alMedia.episodes || jd?.episodes || episodes.length,
+        score: alMedia.averageScore || (jd?.score ? Math.round(jd.score*10) : null),
+        providers,
         miruro_url: `https://www.miruro.to/watch/${anilistId}`,
-        studios: (m.studios?.edges||[]).filter(e=>e.isMain).map(e=>e.node?.name).filter(Boolean),
-        relations: (m.relations?.edges||[]).map(e=>({
-            type: e.relationType,
-            id: String(e.node?.id),
-            title: e.node?.title?.romaji,
-            mediaType: e.node?.type,
-        })),
-        streaming_episodes: m.streamingEpisodes || [],
     };
 }
 
 async function getRecentAnime(page = 1) {
-    const data = await al(
-        `query($p:Int){
-            Page(page:$p, perPage:24){
-                media(type:ANIME, status:RELEASING, sort:UPDATED_AT_DESC){
-                    id idMal title { romaji english }
-                    coverImage { large }
-                    nextAiringEpisode { episode }
-                    episodes
-                }
-            }
-        }`,
-        { p: parseInt(page) }
-    );
-    return (data.Page?.media || []).map(m => ({
-        title: m.title?.english || m.title?.romaji || null,
-        episode: m.nextAiringEpisode ? `Episode ${m.nextAiringEpisode.episode - 1}` : `Episode ${m.episodes || "?"}`,
-        image: m.coverImage?.large || null,
-        id: String(m.id),
-        malId: m.idMal ? String(m.idMal) : String(m.id),
-        miruro_url: `https://www.miruro.to/watch/${m.id}`,
+    const data = await jikan(`/seasons/now?page=${parseInt(page)}&limit=24`);
+    return (data.data || []).map(a => ({
+        title: a.title_english || a.title || null,
+        episode: `Episode ${a.episodes || "?"}`,
+        image: a.images?.jpg?.image_url || null,
+        id: String(a.mal_id),
+        malId: String(a.mal_id),
+        miruro_url: `https://www.miruro.to/watch/${a.mal_id}`,
     }));
 }
 
 async function getPopularAnime(page = 1, max = 20) {
-    const data = await al(
-        `query($p:Int,$pp:Int){
-            Page(page:$p, perPage:$pp){
-                media(type:ANIME, sort:POPULARITY_DESC){
-                    id idMal title { romaji english }
-                    coverImage { large }
-                    startDate { year }
-                }
-            }
-        }`,
-        { p: parseInt(page), pp: max }
-    );
-    return (data.Page?.media || []).map(m => ({
-        title: m.title?.english || m.title?.romaji || null,
-        releaseDate: m.startDate?.year ? String(m.startDate.year) : null,
-        image: m.coverImage?.large || null,
-        id: String(m.id),
-        malId: m.idMal ? String(m.idMal) : String(m.id),
-        miruro_url: `https://www.miruro.to/watch/${m.id}`,
+    const data = await jikan(`/top/anime?page=${parseInt(page)}&limit=${max}&filter=bypopularity`);
+    return (data.data || []).slice(0, max).map(a => ({
+        title: a.title_english || a.title || null,
+        releaseDate: a.year ? String(a.year) : null,
+        image: a.images?.jpg?.image_url || null,
+        id: String(a.mal_id),
+        malId: String(a.mal_id),
+        miruro_url: `https://www.miruro.to/watch/${a.mal_id}`,
     }));
 }
 
 async function getEpisode(id) {
-    // Split only on first 3 colons: provider:anilistId:category:episodeId
-    // episodeId itself may contain colons
     const p1 = id.indexOf(":");
     const p2 = id.indexOf(":", p1 + 1);
     const p3 = id.indexOf(":", p2 + 1);
-
-    if (p1 < 0 || p2 < 0 || p3 < 0) {
-        return {
-            error: "Invalid format. Use: provider:anilistId:sub|dub:episodeId",
-            tip: "Get episode IDs from /anime/{id} first",
-        };
-    }
-
+    if (p1 < 0 || p2 < 0 || p3 < 0) return {
+        error: "Invalid format. Use: provider:anilistId:sub|dub:episodeId",
+        tip: "Get episode IDs from /anime/{id} first",
+    };
     const provider  = id.slice(0, p1);
-    const anilistId = id.slice(p1 + 1, p2);
-    const category  = id.slice(p2 + 1, p3);
-    const episodeId = id.slice(p3 + 1);   // full episode ID including any colons
-
-    const encId = b64url(episodeId);
-
+    const anilistId = id.slice(p1+1, p2);
+    const category  = id.slice(p2+1, p3);
+    const episodeId = id.slice(p3+1);
     const data = await pipeFetch("sources", {
-        episodeId: encId,
-        provider,
-        category,
-        anilistId,
+        episodeId: b64url(episodeId), provider, category, anilistId,
     });
-
-    // Miruro pipe returns data.streams (not data.sources)
-    const streams   = data?.streams  || data?.sources || data?.stream || [];
-    const subtitles = data?.subtitles || data?.tracks || [];
-    const download  = data?.download || null;
-
-    // Normalise stream objects
+    const streams = data?.streams || data?.sources || data?.stream || [];
     const sources = streams.map(s => ({
         url:      s.url || null,
         type:     s.type || "hls",
@@ -326,23 +285,19 @@ async function getEpisode(id) {
         isActive: s.isActive !== undefined ? s.isActive : true,
         ...(s.resolution ? { resolution: s.resolution } : {}),
     }));
-
     return {
-        provider,
-        anilistId,
-        category,
-        episodeId,
-        sources,          // normalised stream list
-        subtitles,
-        download,
-        intro:   data?.intro   || null,
-        outro:   data?.outro   || null,
+        provider, anilistId, category, episodeId,
+        sources,
+        subtitles: data?.subtitles || data?.tracks || [],
+        download: data?.download || null,
+        intro: data?.intro || null,
+        outro: data?.outro || null,
         headers: data?.headers || null,
         ...(sources.length === 0 ? { debug_raw: data } : {}),
     };
 }
 
-async function GogoDLScrapper(a, b) { return { note: "Use /episode/provider:anilistId:sub|dub:episodeId" }; }
+async function GogoDLScrapper(a, b) { return { note: "Use /episode/provider:id:sub|dub:episodeId" }; }
 async function getGogoAuthKey() { return ""; }
 
 export { getSearch, getAnime, getRecentAnime, getPopularAnime, getEpisode, GogoDLScrapper, getGogoAuthKey };
