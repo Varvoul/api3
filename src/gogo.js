@@ -310,20 +310,34 @@ async function getEpisode(id) {
         anilistId,
     });
 
-    const sources  = data?.sources  || data?.stream || [];
-    const subtitles = data?.subtitles || data?.tracks  || [];
+    // Miruro pipe returns data.streams (not data.sources)
+    const streams   = data?.streams  || data?.sources || data?.stream || [];
+    const subtitles = data?.subtitles || data?.tracks || [];
+    const download  = data?.download || null;
+
+    // Normalise stream objects
+    const sources = streams.map(s => ({
+        url:      s.url || null,
+        type:     s.type || "hls",
+        quality:  s.quality || null,
+        codec:    s.codec || null,
+        audio:    s.audio || s.server || null,
+        referer:  s.referer || null,
+        isActive: s.isActive !== undefined ? s.isActive : true,
+        ...(s.resolution ? { resolution: s.resolution } : {}),
+    }));
 
     return {
         provider,
         anilistId,
         category,
         episodeId,
-        sources,
+        sources,          // normalised stream list
         subtitles,
+        download,
         intro:   data?.intro   || null,
         outro:   data?.outro   || null,
         headers: data?.headers || null,
-        // Include raw if sources empty to help debug
         ...(sources.length === 0 ? { debug_raw: data } : {}),
     };
 }
