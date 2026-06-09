@@ -1,4 +1,5 @@
-// gogo.js - AniList GraphQL search + Anivexa for episodes/streams (AniKoto provider)
+// gogo.js - AniList GraphQL search + Anivexa API for episodes/streams
+// Anivexa routes: /episodes/:anilistId, /watch/:provider/:id/sub|dub/:provider-:ep
 
 const ANILIST = "https://graphql.anilist.co";
 const ANIVEXA = "https://anivexa.bionmovies47.workers.dev";
@@ -17,42 +18,25 @@ async function al(query, variables = {}) {
     return json.data;
 }
 
-const LIST_FIELDS = `
-    id idMal
-    title { romaji english native userPreferred }
-    coverImage { extraLarge large medium }
-    bannerImage
-    startDate { year }
-    season seasonYear format status
+const LIST_FIELDS = `id idMal title{romaji english native userPreferred}
+    coverImage{extraLarge large medium} bannerImage
+    startDate{year} season seasonYear format status
     episodes duration averageScore meanScore popularity
-    genres isAdult
-    nextAiringEpisode { episode airingAt }
-`;
+    genres isAdult nextAiringEpisode{episode airingAt}`;
 
-const FULL_FIELDS = `
-    id idMal
-    title { romaji english native userPreferred }
-    coverImage { extraLarge large medium }
-    bannerImage
-    startDate { year month day }
-    endDate { year month day }
+const FULL_FIELDS = `id idMal title{romaji english native userPreferred}
+    coverImage{extraLarge large medium} bannerImage
+    startDate{year month day} endDate{year month day}
     season seasonYear format status source
     episodes duration averageScore meanScore popularity
-    genres tags { name }
-    description(asHtml: false)
-    studios { edges { isMain node { id name } } }
-    relations { edges { relationType node { id title { romaji english } type format } } }
-    recommendations(perPage: 10) {
-        edges { node { mediaRecommendation {
-            id idMal title { romaji english }
-            coverImage { large } format episodes averageScore
-        }}}
-    }
-    streamingEpisodes { title thumbnail url site }
-    trailer { id site }
-    externalLinks { url site }
-    isAdult
-`;
+    genres tags{name} description(asHtml:false)
+    studios{edges{isMain node{id name}}}
+    relations{edges{relationType node{id title{romaji english}type format}}}
+    recommendations(perPage:10){edges{node{mediaRecommendation{
+        id idMal title{romaji english}coverImage{large}format episodes averageScore
+    }}}}
+    streamingEpisodes{title thumbnail url site}
+    trailer{id site} externalLinks{url site} isAdult`;
 
 function fmtListItem(m) {
     return {
@@ -65,7 +49,7 @@ function fmtListItem(m) {
         title_native: m.title?.native || null,
         img: m.coverImage?.large || m.coverImage?.medium || null,
         banner: m.bannerImage || null,
-        link: `https://www.miruro.to/watch/${m.id}`,
+        link: `https://aniocean.vercel.app/watch/${m.id}`,
         releaseDate: m.startDate?.year ? String(m.startDate.year) : null,
         season: m.season || null,
         seasonYear: m.seasonYear || null,
@@ -81,13 +65,11 @@ function fmtListItem(m) {
     };
 }
 
-// ── Anivexa API helpers ───────────────────────────────────────────────────────
+// ── Anivexa helpers ───────────────────────────────────────────────────────────
 
-async function anivexa(path) {
-    const res = await fetch(`${ANIVEXA}${path}`, {
-        headers: { "Accept": "application/json" }
-    });
-    if (!res.ok) throw new Error(`Anivexa ${res.status}`);
+async function anivexaGet(path) {
+    const res = await fetch(`${ANIVEXA}${path}`, { headers: { Accept: "application/json" } });
+    if (!res.ok) throw new Error(`Anivexa ${res.status} for ${path}`);
     return res.json();
 }
 
@@ -96,10 +78,10 @@ async function anivexa(path) {
 async function getSearch(name, page = 1) {
     const title = decodeURIComponent(String(name)).trim();
     const data = await al(
-        `query($search: String, $page: Int, $perPage: Int) {
-            Page(page: $page, perPage: $perPage) {
-                pageInfo { total currentPage lastPage hasNextPage }
-                media(search: $search, type: ANIME, sort: SEARCH_MATCH) { ${LIST_FIELDS} }
+        `query($search:String,$page:Int,$perPage:Int){
+            Page(page:$page,perPage:$perPage){
+                pageInfo{total currentPage lastPage hasNextPage}
+                media(search:$search,type:ANIME,sort:SEARCH_MATCH){${LIST_FIELDS}}
             }
         }`,
         { search: title, page: parseInt(page), perPage: 20 }
@@ -109,25 +91,21 @@ async function getSearch(name, page = 1) {
 
 async function getAnime(id) {
     const numId = parseInt(id);
-
-    // Resolve AniList media
     let media = null;
+
     if (isNaN(numId)) {
-        // Name string
         const data = await al(
-            `query($s: String) { Media(search: $s, type: ANIME) { ${FULL_FIELDS} } }`,
+            `query($s:String){Media(search:$s,type:ANIME){${FULL_FIELDS}}}`,
             { s: decodeURIComponent(String(id)).trim() }
         );
         media = data.Media;
     } else {
-        // Try as AniList ID first
         try {
-            const data = await al(`query($id: Int) { Media(id: $id, type: ANIME) { ${FULL_FIELDS} } }`, { id: numId });
+            const data = await al(`query($id:Int){Media(id:$id,type:ANIME){${FULL_FIELDS}}}`, { id: numId });
             media = data.Media;
         } catch(_) {}
-        // Fallback: try as MAL ID
         if (!media) {
-            const data = await al(`query($id: Int) { Media(idMal: $id, type: ANIME) { ${FULL_FIELDS} } }`, { id: numId });
+            const data = await al(`query($id:Int){Media(idMal:$id,type:ANIME){${FULL_FIELDS}}}`, { id: numId });
             media = data.Media;
         }
     }
@@ -135,44 +113,41 @@ async function getAnime(id) {
 
     const anilistId = media.id;
 
-    // Fetch episodes from Anivexa (AniKoto provider)
-    let episodesData = null;
+    // Fetch all episodes from Anivexa (aggregates 7 providers)
+    let epResponse = null;
     try {
-        episodesData = await anivexa(`/episodes/anikoto/${anilistId}`);
+        epResponse = await anivexaGet(`/episodes/${anilistId}`);
     } catch(_) {}
 
-    const subEps = episodesData?.episodes?.sub || [];
-    const dubEps = episodesData?.episodes?.dub || [];
-
-    // Build unified episode list
+    // Anivexa returns: { providers: { anikoto: { sub: [...], dub: [...] }, allmanga: {...}, ... } }
+    const providers_summary = {};
     const episodes = [];
-    for (const ep of subEps) {
-        episodes.push([String(ep.number), ep.id, "sub", {
-            title: ep.title,
-            image: ep.image,
-            airDate: ep.airDate,
-            filler: ep.filler,
-            hasDub: false,
-        }]);
-    }
-    // Mark which episodes have dub
-    const dubNums = new Set(dubEps.map(e => e.number));
-    for (const ep of episodes) ep[3].hasDub = dubNums.has(parseInt(ep[0]));
 
-    // Add dub-only entries (episodes that have dub but not sub)
-    const subNums = new Set(subEps.map(e => e.number));
-    for (const ep of dubEps) {
-        if (!subNums.has(ep.number)) {
-            episodes.push([String(ep.number), ep.id, "dub", {
-                title: ep.title,
-                image: ep.image,
-                airDate: ep.airDate,
-                filler: ep.filler,
-                hasDub: true,
-            }]);
+    if (epResponse?.providers) {
+        for (const [provName, provData] of Object.entries(epResponse.providers)) {
+            providers_summary[provName] = { categories: [] };
+            for (const cat of ["sub", "dub"]) {
+                const epList = provData[cat] || [];
+                if (epList.length === 0) continue;
+                providers_summary[provName].categories.push(cat);
+                for (const ep of epList) {
+                    episodes.push([
+                        String(ep.number ?? ep.id),
+                        // Anivexa watch URL: /watch/{provider}/{anilistId}/{cat}/{provider}-{epNum}
+                        `${provName}:${anilistId}:${cat}:${provName}-${ep.number ?? ep.id}`,
+                        {
+                            title: ep.title || null,
+                            image: ep.image || null,
+                            airDate: ep.airDate || null,
+                            filler: ep.filler || false,
+                        }
+                    ]);
+                }
+            }
         }
+        // Sort by episode number
+        episodes.sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]));
     }
-    episodes.sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
 
     const recs = (media.recommendations?.edges || [])
         .map(e => e.node?.mediaRecommendation).filter(Boolean)
@@ -224,23 +199,15 @@ async function getAnime(id) {
         streaming_episodes: media.streamingEpisodes || [],
         trailer: media.trailer || null,
         external_links: media.externalLinks || [],
-        miruro_url: `https://www.miruro.to/watch/${anilistId}`,
-        providers: {
-            anikoto: {
-                sub: subEps.length,
-                dub: dubEps.length,
-            }
-        },
+        providers: providers_summary,
     };
 }
 
 async function getRecentAnime(page = 1) {
     const data = await al(
-        `query($p: Int) {
-            Page(page: $p, perPage: 24) {
-                media(type: ANIME, status: RELEASING, sort: UPDATED_AT_DESC) { ${LIST_FIELDS} }
-            }
-        }`,
+        `query($p:Int){Page(page:$p,perPage:24){
+            media(type:ANIME,status:RELEASING,sort:UPDATED_AT_DESC){${LIST_FIELDS}}
+        }}`,
         { p: parseInt(page) }
     );
     return (data.Page?.media || []).map(fmtListItem);
@@ -248,77 +215,60 @@ async function getRecentAnime(page = 1) {
 
 async function getPopularAnime(page = 1, max = 20) {
     const data = await al(
-        `query($p: Int, $pp: Int) {
-            Page(page: $p, perPage: $pp) {
-                media(type: ANIME, sort: POPULARITY_DESC) { ${LIST_FIELDS} }
-            }
-        }`,
+        `query($p:Int,$pp:Int){Page(page:$p,perPage:$pp){
+            media(type:ANIME,sort:POPULARITY_DESC){${LIST_FIELDS}}
+        }}`,
         { p: parseInt(page), pp: max }
     );
     return (data.Page?.media || []).map(fmtListItem);
 }
 
-// getEpisode: fetch real streams from Anivexa
-// id format: "watch/anikoto/{anilistId}/sub/anikoto-{epNum}"
+// getEpisode - episode ID format from /anime response:
+// "anikoto:20:sub:anikoto-1"   → GET /watch/anikoto/20/sub/anikoto-1
+// "allmanga:20:dub:allmanga-5" → GET /watch/allmanga/20/dub/allmanga-5
 async function getEpisode(id) {
-    // Support the Anivexa episode ID format directly
-    if (id.startsWith("watch/anikoto/")) {
-        const data = await anivexa(`/${id}`);
-        const result = data?.ssub || data?.sdub || data;
-        return {
-            episodeId: id,
-            sources: (result?.streams || []).map(s => ({
-                url: s.url || null,
-                type: s.type || "hls",
-                quality: s.quality || null,
-                server: s.server || null,
-                referer: s.referer || null,
-                isDefault: s.default || false,
-                priority: s.priority || 0,
-            })),
-            subtitles: result?.subtitles || [],
-            intro: result?.intro || null,
-            outro: result?.outro || null,
-            provider: result?.provider || "anikoto",
-        };
-    }
-
-    // Legacy miruro format: provider:anilistId:sub|dub:episodeId
-    const p1 = id.indexOf(":");
-    const p2 = id.indexOf(":", p1 + 1);
-    const p3 = id.indexOf(":", p2 + 1);
-    if (p1 < 0 || p2 < 0 || p3 < 0) return {
-        error: "Use episode ID from /anime/{id} response",
-        formats: [
-            "watch/anikoto/{anilistId}/sub/anikoto-{epNum}",
-            "watch/anikoto/{anilistId}/dub/anikoto-{epNum}"
-        ]
+    const parts = id.split(":");
+    if (parts.length < 4) return {
+        error: "Invalid format",
+        expected: "provider:anilistId:sub|dub:provider-epNum",
+        example: "anikoto:20:sub:anikoto-1",
+        tip: "Episode IDs come from /anime/{id} response"
     };
 
-    const provider = id.slice(0, p1);
-    const anilistId = id.slice(p1+1, p2);
-    const category = id.slice(p2+1, p3);
-    const epNum = id.slice(p3+1).replace("anikoto-","");
+    const [provider, anilistId, category, epSlug] = parts;
+    // Anivexa route: /watch/{provider}/{anilistId}/{category}/{epSlug}
+    const watchPath = `/watch/${provider}/${anilistId}/${category}/${epSlug}`;
 
-    const data = await anivexa(`/watch/anikoto/${anilistId}/${category}/anikoto-${epNum}`);
-    const result = data?.ssub || data?.sdub || data;
+    const data = await anivexaGet(watchPath);
+
+    // Anivexa returns sources/streams depending on provider
+    const streams = data?.streams || data?.sources || data?.ssub?.streams || data?.sdub?.streams || [];
+    const sources = streams.map(s => ({
+        url:      s.url || null,
+        type:     s.type || "hls",
+        quality:  s.quality || s.resolution || null,
+        server:   s.server || s.name || null,
+        referer:  s.referer || s.headers?.Referer || null,
+        isDefault: s.default || s.isDefault || false,
+        priority: s.priority || 0,
+        ...(s.headers ? { headers: s.headers } : {}),
+    }));
+
     return {
-        provider, anilistId, category, episode: epNum,
-        sources: (result?.streams || []).map(s => ({
-            url: s.url || null,
-            type: s.type || "hls",
-            quality: s.quality || null,
-            server: s.server || null,
-            referer: s.referer || null,
-            isDefault: s.default || false,
-        })),
-        subtitles: result?.subtitles || [],
-        intro: result?.intro || null,
-        outro: result?.outro || null,
+        provider,
+        anilistId,
+        category,
+        episode: epSlug,
+        sources,
+        subtitles: data?.subtitles || data?.tracks || data?.captions || [],
+        intro: data?.intro || null,
+        outro: data?.outro || null,
+        download: data?.download || null,
+        ...(sources.length === 0 ? { debug_raw: data } : {}),
     };
 }
 
-async function GogoDLScrapper(a, b) { return { note: "Use /episode/{episodeId} where episodeId comes from /anime/{id}" }; }
+async function GogoDLScrapper(a, b) { return { note: "Use /episode/provider:anilistId:sub|dub:provider-epNum" }; }
 async function getGogoAuthKey() { return ""; }
 
 export { getSearch, getAnime, getRecentAnime, getPopularAnime, getEpisode, GogoDLScrapper, getGogoAuthKey };
